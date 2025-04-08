@@ -1,0 +1,338 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Web.Http;
+using BasicAuthentication;
+using IDHW_API.Classes;
+using Newtonsoft.Json;
+using static IDHW_API.Classes.FACSClientSearch;
+using static IDHW_API.Classes.FACSNotificationEvent;
+
+namespace IDHW_API.Controllers
+{
+    public class FACSController : ApiController
+    {
+        [BasicAuthentication]
+        [HttpGet, Route("api/v1/juvenile/{ijosID}/metadata")]
+        public HttpResponseMessage DJCJuvenileLookup(Int32 ijosID)
+        {
+            DjcMetadata results;
+            HttpStatusCode statusCode = HttpStatusCode.OK;
+
+            var respErr = new ErrorModel();
+
+            try
+            {
+                using (var s = new dbIJOS())
+                {
+                    if (s.IDisValid(ijosID))
+                    {
+                        results = s.FACSMetadataSearch(ijosID);
+
+                        if (string.IsNullOrWhiteSpace(results.IDHWClientId))
+                        {
+                            statusCode = HttpStatusCode.NotFound;
+
+                            respErr.Message = "Resource Not Found";
+                            respErr.ErrorDetails = new List<ErrorDetails>()
+                            {
+                                new ErrorDetails()
+                                {
+                                    Code = "444",
+                                    Message = "Bad Client Request"
+                                }
+                            };
+
+                            return Request.CreateResponse(statusCode, respErr);
+                        }
+                        else
+                        {
+                            //Respond OK to the request
+                            return Request.CreateResponse(statusCode, results);
+                        }
+                    }
+                    else
+                    {
+                        statusCode = HttpStatusCode.BadRequest;
+                        respErr.Message = "Resource Not Found";
+                        var newErr = new ErrorDetails()
+                        {
+                            Code = "444",
+                            Message = "Bad Client Request"
+                        };
+
+                        return Request.CreateResponse(statusCode, respErr);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    respErr.Message = "Internal Server Error. Please contact IDJC.";
+                    respErr.ErrorDetails = new List<ErrorDetails>()
+                    {
+                        new ErrorDetails()
+                        {
+                            Code = "500",
+                            Message = "Internal Server Error"
+                            //Message = ex.Message.ToString() + ex.InnerException.ToString()
+                        }
+                    };
+                    
+                    //write code here that sends the error to the DB audit table (ex.Message, etc.)
+                    
+                    return Request.CreateResponse(HttpStatusCode.BadRequest, respErr);
+                }
+                catch (Exception)
+                {
+                    throw;
+                }
+            }
+        }
+        
+        [BasicAuthentication]
+        [HttpPost, Route("api/v1/juvenile/{ijosID}/notifications")]
+        public HttpResponseMessage NotificationEvent(Int32 ijosID, [FromBody] FACSPlacement body)
+        {
+            //Newtonsoft.Json.JsonConvert.SerializeObject(body)	"{\"eventName\":\"NEW_PLACEMENT_EPISODE_START\",\"DJCClientId\":3321,\"eventDetails\":{\"DJCClientId\":3321,\"placementEpisodeStartDate\":\"2020-04-01\",\"removalReason\":\"Abandonment\",\"assignedWorker\":\"Jason Bourne\",\"supervisor\":\"Lindsay Anderson\"}}"	string
+            FACSNotificationEvent results;
+            HttpResponseMessage response;
+            HttpStatusCode statusCode = HttpStatusCode.OK;
+            
+            var respErr = new ErrorModel();
+            respErr.Message = "Success with ";
+
+            try
+            {
+                using (var s = new dbIJOS())
+                {
+                    //validate the notification information being passed in & return any errors
+                    respErr = s.NotificationBodyisValid(ijosID, body);
+
+                    //if there are errors, return the correct code
+                    if (respErr.ErrorDetails.Count > 0)
+                    {
+                        statusCode = respErr.ErrorDetails[0].Code == "999" ? (HttpStatusCode)444 : HttpStatusCode.BadRequest;
+                        response = Request.CreateResponse(statusCode, respErr);
+                    }
+                    else
+                    {
+                        //write notification event to IJOS
+                        results = s.FACSNotification(ijosID, body);
+
+                        //response = Request.CreateResponse(statusCode, respErr.Message + body.NotificationType.ToString());
+                        response = Request.CreateResponse(statusCode, respErr.Message + "Success");
+                    }
+                }
+
+                return response;
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    HttpStatusCode respCode = HttpStatusCode.BadRequest;
+
+                    if (ex.Message.ToString() == "Input string was not in a correct format.")
+                    {
+                        //respErr.Message = "Input Format Error";
+                        respErr.Message = "Bad Client Request";
+                        respErr.ErrorDetails = new List<ErrorDetails>()
+                        {
+                            new ErrorDetails()
+                            {
+                                Code = "400",
+                                Message = "Invalid Object Type"
+                                //Message = ex.Message + ex.InnerException
+                            }
+                        };
+                    }
+                    else if (ex.Message.ToString().Substring(0,9) == "ORA-01861")
+                    {
+                        respErr.Message = "Bad Client Request";
+                        respErr.ErrorDetails = new List<ErrorDetails>()
+                        {
+                            new ErrorDetails()
+                            {
+                                Code = "400",
+                                Message = "Invalid Object Type"
+                                //Message = ex.Message + ex.InnerException
+                            }
+                        };
+                    }
+                    else
+                    {
+                        respErr.Message = "Internal Server Error";
+                        respErr.ErrorDetails = new List<ErrorDetails>()
+                        {
+                            new ErrorDetails()
+                            {
+                                Code = "500",
+                                Message = "Internal Server Error"
+                                //Message = ex.Message + ex.InnerException
+                            }
+                        };
+
+                        respCode = HttpStatusCode.InternalServerError;
+
+                        //write code here that sends the error to the DB audit table (ex.Message, etc.)
+                    }
+
+                    return Request.CreateResponse(respCode, respErr);
+                }
+                catch (Exception)
+                {
+                    throw;
+                }
+            }
+        }
+
+        [BasicAuthentication]
+        [HttpPost, Route("api/v1/juvenile")]
+        public HttpResponseMessage ClientMatch([FromBody] IDHWClient body)
+        {
+            FACSClientSearch results;
+            //IDHWClient results;
+            HttpResponseMessage response;
+            HttpStatusCode statusCode = HttpStatusCode.OK;
+
+            var respErr = new ErrorModel();
+
+            try
+            {
+                using (var s = new dbIJOS())
+                {
+                    //validate the notification information being passed in & return any errors
+                    respErr = s.CheckMatchValues(body);
+
+                    if(respErr.ErrorDetails.Count > 0)
+                    {
+                        response = Request.CreateResponse(HttpStatusCode.BadRequest, respErr);
+                    }
+                    else
+                    {
+                        //Check for a match in IJOS
+                        results = s.GetIJOSNumber(body);
+
+                        //possible 'no' options are 'no match' & 'multiple matches'
+                        if (results.DjcClientId.Substring(0,2) == "NO")
+                        {
+                            statusCode = HttpStatusCode.NotFound;
+
+                            respErr.Message = "No Unique Resource Found";
+                            respErr.ErrorDetails = new List<ErrorDetails>()
+                            {
+                                new ErrorDetails()
+                                {
+                                    Code = "444",
+                                    Message = results.DjcClientId.ToString()
+                                }
+                            };
+
+                            response = Request.CreateResponse((HttpStatusCode)444, respErr);//typecast the 444 as a custom status code
+                        } 
+                        else if(results.DjcClientId.Substring(0,3) == "BAD")
+                        {
+                            respErr.Message = "Bad Client Request";
+                            respErr.ErrorDetails = new List<ErrorDetails>()
+                            {
+                                new ErrorDetails()
+                                {
+                                    Code = "400",
+                                    Message = "Validation Error"
+                                }
+                            };
+
+                            response = Request.CreateResponse(HttpStatusCode.BadRequest, respErr);
+                        }
+                        else if(results.DjcClientId == "0")
+                        {
+                            respErr.Message = "Internal Server Error. Please contact IDJC.";
+                            respErr.ErrorDetails = new List<ErrorDetails>()
+                            {
+                                new ErrorDetails()
+                                {
+                                    Code = "500",
+                                    Message = "Internal Server Error"
+                                }
+                            };
+
+                            response = Request.CreateResponse(statusCode, respErr);
+                        }
+                        else
+                        {
+                            //A match was found - respond OK & return IJOS ID
+                            response = Request.CreateResponse(statusCode, results.DjcClientId.ToString());
+                        }
+                    }
+
+                    return response;
+                }
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    if (ex.Message.ToString() == "Date string was not in a correct format." || ex.Message.Substring(0,28).ToString() == "ORA-01843: not a valid month")
+                    {
+                        respErr.Message = "Input Format Error";
+                        respErr.ErrorDetails = new List<ErrorDetails>()
+                        {
+                            new ErrorDetails()
+                            {
+                            Code = "102",
+                            Message = "Invalid Object Type"
+                            }
+                        };
+                    }
+                    else if(ex.Message.ToString() == "Input string was not in a correct format." || ex.Message.Substring(0,73).ToString() == "ORA-01858: a non-numeric character was found where a numeric was expected")
+                    {
+                        respErr.Message = "Input Format Error";
+                        respErr.ErrorDetails = new List<ErrorDetails>()
+                        {
+                            new ErrorDetails()
+                            {
+                            Code = "103",
+                            Message = "Invalid Object Type"
+                            }
+                        };
+                    }
+                    else if (ex.Message.Substring(0,47).ToString() == "ORA-01861: literal does not match format string")
+                    {
+                        respErr.Message = "Bad Client Request";
+                        respErr.ErrorDetails = new List<ErrorDetails>()
+                        {
+                            new ErrorDetails()
+                            {
+                            Code = "400",
+                            Message = "Input Format Error"
+                            }
+                        };
+                    }
+                    else
+                    {
+                        respErr.Message = "Internal Server Error. Please contact IDJC.";
+                        respErr.ErrorDetails = new List<ErrorDetails>()
+                        {
+                            new ErrorDetails()
+                            {
+                                Code = "500",
+                                //Message = "Internal Server Error"
+                                Message = ex.Message + ex.InnerException
+                            }
+                        };
+                    }
+
+                    return Request.CreateResponse(HttpStatusCode.BadRequest, respErr);
+                }
+                catch (Exception)
+                {
+                    throw;
+                }
+            }
+        }
+    }
+}

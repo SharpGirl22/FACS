@@ -1,0 +1,583 @@
+﻿using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Configuration;
+using System.Data;
+using System.Diagnostics;
+using System.Linq;
+using System.Net.Http;
+using System.ServiceProcess;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Timers;
+using System.Windows.Forms;
+using System.Xml;
+using Newtonsoft.Json;
+using Oracle.ManagedDataAccess.Client;
+using Oracle.ManagedDataAccess.Types;
+using RestSharp;
+
+namespace IDHWService
+{
+    partial class IDHWService : ServiceBase
+    {
+        OracleConnection oCon = new OracleConnection();
+        OracleCommand oCmd = new OracleCommand();
+
+        System.Timers.Timer timer = new System.Timers.Timer();
+
+        private EventLog eventLog;
+        private DataSet ds = null;
+        //private DataSet dsNotifications = null;
+
+        private int FACS_ID = 0;
+        private string strUser = string.Empty;
+        private string strPassword = string.Empty;
+        private string strDBname = string.Empty;
+
+        public IDHWService()
+        {
+            InitializeComponent();
+
+            eventLog = new EventLog();
+
+            if (!EventLog.SourceExists("IDHWServiceSource"))
+            {
+                EventLog.CreateEventSource("IDHWServiceSource", "IDHWServiceLog");
+            }
+
+            eventLog.Log = "IDHWServiceLog";//shows in EventViewer --> Applications & Service Logs
+            eventLog.Source = "IDHW API Call";//shows in EventViewer Source column when IDHWServiceLog is selected            
+        }
+
+        protected override void OnStart(string[] args)
+        {
+            // TODO: Add code here to start your service.
+            eventLog.WriteEntry("IDHWService Started");
+
+            timer.Interval = (60000 * 20); //20 minutes
+            //timer.Interval = (60000 * 5); //5 minutes
+            //timer.Interval = (60000 * 1); //1 minute
+
+            timer.Elapsed += new System.Timers.ElapsedEventHandler(this.OnTimer);
+            timer.Start();
+        }
+
+        /// <summary>
+        /// Service runs first for the client match process, then for the notifications
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="e"></param>
+        private void OnTimer(object sender, ElapsedEventArgs e)
+        {
+            timer.Enabled = false;
+
+            //--------------------------------------------CLIENT MATCH PROCESS--------------------------------------------
+            CallStoredProc("CLIENT MATCH", 0, 0);
+
+            //if there are any clients found...
+            if (ds.Tables[0].Rows.Count > 0)
+            {
+                RunClientMatchProcess(ds);
+            }
+            else
+            {
+                eventLog.WriteEntry("No new juveniles found to for client match process at " + DateTime.Today.ToString());
+            }
+
+            //------------------------------------------------------------------------------------------------------------
+
+            //---------------------------------EVENT NOTIFICATION PROCESS---------------------------------
+            //grab any events triggered since the service ran last
+            CallStoredProc("GET EVENTS", 0, 0);
+
+            //if there are any events found...
+            if (ds.Tables[0].Rows.Count > 0)
+            {
+                RunNotificationsProcess(ds);
+            }
+            else
+            {
+                eventLog.WriteEntry("No new events found to notify IDHW at " + DateTime.Today.ToString());
+            }
+            //--------------------------------------------------------------------------------------------
+
+            timer.Enabled = true;
+        }
+
+        private void RunClientMatchProcess(DataSet dsClientMatchList)
+        {
+            var clientURL = ConfigurationManager.AppSettings.Get("dhwESPIURL") + "v1/clients";
+
+            ///loop through the IDs and call the IDHW Client Match API for each SIN in the list
+            foreach (DataRow dr in dsClientMatchList.Tables[0].Rows)
+            {
+                eventLog.WriteEntry("Juvenile found: " + dr["sin"].ToString() + ", " + dr["first_name"].ToString() + ", " + dr["last_name"].ToString() + ", " + dr["middle_name"].ToString() + ", " + dr["sex"].ToString() + ", " + dr["dob"].ToString() + ", " + dr["ssn"].ToString());
+
+                //Populate the info needed for the API Client Match call
+                var client = new Juvenile()
+                {
+                    DJCClientID = dr["sin"].ToString(),
+                    FirstName = dr["first_name"].ToString(),
+                    LastName = dr["last_name"].ToString(),
+                    MiddleName = dr["middle_name"].ToString(),
+                    Gender = dr["sex"].ToString(),
+                    DateOfBirth = dr["dob"].ToString(),
+                    SSN = dr["ssn"].ToString()
+                };
+
+                //Call the IDHW API and request a matching FACS ID
+                var apiResponse = CallIDHWAPI(clientURL, JsonConvert.SerializeObject(client));
+
+                eventLog.WriteEntry(JsonConvert.SerializeObject(client));//sends Json to the EventLog...for testing
+                string strMsg = JsonConvert.DeserializeObject(apiResponse.Content).ToString();
+
+                //a match was found
+                if (apiResponse.StatusCode.ToString() == "OK")
+                {
+                    eventLog.WriteEntry("Event received: " + strMsg);
+
+                    FACS_ID = Int32.Parse(JsonConvert.DeserializeObject(apiResponse.Content).ToString());
+                    eventLog.WriteEntry("Match found!  Calling the INSERT procedure for IJOS ID# " + client.DJCClientID + " which matches FACS ID# " + FACS_ID.ToString());
+
+                    //add the match to the facs_linkage table
+                    CallStoredProc("INSERT LINKAGE", Int32.Parse(client.DJCClientID), FACS_ID);
+                }
+                else//error or no match found
+                {
+                    eventLog.WriteEntry("apiResponse.StatusCode: " + apiResponse.StatusCode + "\nMessage:\n" + strMsg);
+
+                    //ignore no match responses
+                    if (apiResponse.StatusCode.ToString() != "444")
+                    {
+                        //call a stored procedure and send down the errorStatus (400 or 500), the SIN being checked, and the error message that will email IJOS Support
+                        CallErrorProc("Client Match Process", Int32.Parse(dr["sin"].ToString()), Int32.Parse(dr["staging_id"].ToString()), apiResponse.StatusCode.ToString(), JsonConvert.DeserializeObject(apiResponse.Content).ToString());
+                    }
+                }
+
+                //Now, delete this SPECIFIC - staging ID - record from the staging table
+                CallStoredProc("DELETE", Convert.ToInt32(dr["sin"].ToString()), Convert.ToInt32(dr["staging_id"].ToString()));
+                eventLog.WriteEntry("Calling procedure DELETE event for staging ID# " + dr["staging_id"].ToString() + " to delete the SIN " + dr["sin"].ToString() + " from the staging table");
+            }
+        }
+
+        private void RunNotificationsProcess(DataSet dsEventList)
+        {
+            //loop through the events and call the IDHW Notification API for each record in the dataset
+            foreach (DataRow dr in dsEventList.Tables[0].Rows)
+            {
+                var clientURL = string.Format(ConfigurationManager.AppSettings.Get("dhwESPIURL")
+                            + "v1/clients/{0}/notifications",
+                            Int32.Parse(dr["sin"].ToString()));
+
+                //eventLog.WriteEntry("clientURL " + clientURL);...for testing
+                //eventLog.WriteEntry("calling the DB with credentials event_type = " + dr["event_type"].ToString() + " sin = " + dr["sin"].ToString() + " event_id = " + dr["event_id"].ToString());...for testing
+
+                //get info for the event from the db
+                CallStoredProc(dr["event_type"].ToString(), Convert.ToInt32(dr["sin"].ToString()), Convert.ToInt32(dr["event_id"].ToString()));
+
+                if (ds.Tables[0].Rows[0][0].ToString() != "DELETED")
+                {
+                    //set the Json, depending on the event type
+                    var notification = PopulateJSON(dr["event_type"].ToString(), dr["cw_id"].ToString(), ds);
+
+                    eventLog.WriteEntry(JsonConvert.SerializeObject(notification));//sends Json to the EventLog...for testing
+
+                    //--------------------------------Call the API & notify IDHW of this event  -------------------------------    
+                    var apiResponse = CallIDHWAPI(clientURL, JsonConvert.SerializeObject(notification));
+
+                    //stopped returning a "success" value on OK response, so moved this line into the else statement...LA 1-22-22
+                    //string strMsg = JsonConvert.DeserializeObject(apiResponse.Content).ToString();
+
+                    if (apiResponse.StatusCode.ToString() == "OK")
+                    {
+                        //eventLog.WriteEntry("Event received: " + strMsg);//commented out by LA 1-22-22
+                        eventLog.WriteEntry("Event received "+ apiResponse.StatusCode.ToString());
+                    }
+                    else//error or no match found
+                    {
+                        string strMsg = JsonConvert.DeserializeObject(apiResponse.Content).ToString();
+
+                        eventLog.WriteEntry("Notification Process Error: Status Code " + apiResponse.StatusCode.ToString() + "\nMessage:\n" + strMsg);
+
+                        //ignore no match responses
+                        if (apiResponse.StatusCode.ToString() != "444")
+                        {
+                            //call a stored procedure and send down the errorStatus (400 or 500), the SIN being checked, and the error message that will email IJOS Support
+                            CallErrorProc("Notification Process", Int32.Parse(dr["sin"].ToString()), Int32.Parse(dr["cw_id"].ToString()), apiResponse.StatusCode.ToString(), strMsg);
+                        }
+                    }
+                    //-----------------------------------------------------------------------------------------------------------
+                }
+                else
+                {
+                    eventLog.WriteEntry("staging ID# " + dr["staging_id"].ToString() + " for IJOS# " + dr["sin"].ToString() + " was deleted from the parent table for the following event & PK: "
+                        + dr["event_type"].ToString() + "(PK#" + dr["event_id"].ToString() + ")");
+                }
+
+                //Now, delete this SPECIFIC - staging ID - record from the staging table
+                CallStoredProc("DELETE", Convert.ToInt32(dr["sin"].ToString()), Convert.ToInt32(dr["staging_id"].ToString()));
+                eventLog.WriteEntry("Calling procedure DELETE event for staging ID# " + dr["staging_id"].ToString() + " to delete the SIN " + dr["sin"].ToString() + " from the staging table");
+            }
+        }
+
+        /// <summary>
+        /// Prepare the Json that is sent to the API, depending on the event type being called
+        /// </summary>
+        /// <param name="eventType">Either NEW_PROBATION_START, NEW_PROBATION_END, NEW_CUSTODY_START, NEW_CUSTODY_END, or NEW_CHARGES</param>
+        /// <param name="cwID">IDHW client ID</param>
+        /// <param name="ds">dataset from the events list</param>
+        /// <returns></returns>
+        private object PopulateJSON(string eventType, string cwID, DataSet ds)
+        {
+            //--Populate the Json needed, based on the event_type--
+            if (eventType == "NEW_PROBATION_START")
+            {
+                var notification = new NewProbationStartEvent();
+
+                notification.NotificationType = eventType;
+                notification.IDHWClientId = cwID;
+                notification.StartDate = ds.Tables[0].Rows[0]["start_date"].ToString();
+
+                //-----------------------------get JPO information-----------------------------
+                notification.StaffContact = new List<StaffContact>();
+
+                foreach (DataRow drJPO in ds.Tables[0].Rows)
+                {
+                    var jpo = new StaffContact()
+                    {
+                        ProbationOfficerFirstName = drJPO["first_name"].ToString(),
+                        ProbationOfficerLastName = drJPO["last_name"].ToString(),
+                        ProbationOfficerPhone = drJPO["phone"].ToString(),
+                        ProbationOfficerEmail = drJPO["email"].ToString(),
+                    };
+
+                    notification.StaffContact.Add(jpo);
+                }
+                //----------------------------------------------------------------------------
+
+                return notification;
+            }
+            else if (eventType == "NEW_PROBATION_END")
+            {
+                var notification = new NewProbationEndEvent();
+
+                notification.NotificationType = eventType;
+                notification.IDHWClientId = cwID;
+                notification.EndDate = ds.Tables[0].Rows[0]["end_date"].ToString();
+                notification.Outcome = ds.Tables[0].Rows[0]["outcome"].ToString();
+
+                //-----------------------------get JPO information-----------------------------
+                notification.StaffContact = new List<StaffContact>();
+
+                foreach (DataRow drJPO in ds.Tables[0].Rows)
+                {
+                    var jpo = new StaffContact()
+                    {
+                        ProbationOfficerFirstName = drJPO["first_name"].ToString(),
+                        ProbationOfficerLastName = drJPO["last_name"].ToString(),
+                        ProbationOfficerPhone = drJPO["phone"].ToString(),
+                        ProbationOfficerEmail = drJPO["email"].ToString(),
+                    };
+
+                    notification.StaffContact.Add(jpo);
+                }
+                //----------------------------------------------------------------------------
+
+                return notification;
+            }
+            else if (eventType == "NEW_CUSTODY_START")
+            {
+                var notification = new NewCustodyStartEvent();
+
+                notification.NotificationType = eventType;
+                notification.IDHWClientId = cwID;
+                notification.StartDate = ds.Tables[0].Rows[0]["start_date"].ToString();
+                notification.Facility = ds.Tables[0].Rows[0]["facility"].ToString();
+
+                //-----------------------------get JPO information-----------------------------
+                notification.StaffContact = new List<StaffContact>();
+
+                foreach (DataRow drJPO in ds.Tables[0].Rows)
+                {
+                    var jpo = new StaffContact()
+                    {
+                        ProbationOfficerFirstName = drJPO["first_name"].ToString(),
+                        ProbationOfficerLastName = drJPO["last_name"].ToString(),
+                        ProbationOfficerPhone = drJPO["phone"].ToString(),
+                        ProbationOfficerEmail = drJPO["email"].ToString(),
+                    };
+
+                    notification.StaffContact.Add(jpo);
+                }
+                //----------------------------------------------------------------------------
+
+                return notification;
+            }
+            else if (eventType == "NEW_CUSTODY_END")
+            {
+                var notification = new NewCustodyEndEvent();
+
+                notification.NotificationType = eventType;
+                notification.IDHWClientId = cwID;
+                notification.EndDate = ds.Tables[0].Rows[0]["end_date"].ToString();
+                notification.Facility = ds.Tables[0].Rows[0]["facility"].ToString();
+
+                //-----------------------------get JPO information-----------------------------
+                notification.StaffContact = new List<StaffContact>();
+
+                foreach (DataRow drJPO in ds.Tables[0].Rows)
+                {
+                    var jpo = new StaffContact()
+                    {
+                        ProbationOfficerFirstName = drJPO["first_name"].ToString(),
+                        ProbationOfficerLastName = drJPO["last_name"].ToString(),
+                        ProbationOfficerPhone = drJPO["phone"].ToString(),
+                        ProbationOfficerEmail = drJPO["email"].ToString(),
+                    };
+
+                    notification.StaffContact.Add(jpo);
+                }
+                //----------------------------------------------------------------------------
+
+                return notification;
+            }
+            else if (eventType == "NEW_CHARGES")
+            {
+                var notification = new NewChargesEvent();
+
+                notification.NotificationType = eventType;
+                notification.IDHWClientId = cwID;
+                notification.ChargeDate = ds.Tables[0].Rows[0]["charge_date"].ToString();
+                notification.ChargeType = ds.Tables[0].Rows[0]["charge_type"].ToString();
+
+                //-----------------------------get JPO information-----------------------------
+                notification.StaffContact = new List<StaffContact>();
+
+                foreach (DataRow drJPO in ds.Tables[0].Rows)
+                {
+                    var jpo = new StaffContact()
+                    {
+                        ProbationOfficerFirstName = drJPO["first_name"].ToString(),
+                        ProbationOfficerLastName = drJPO["last_name"].ToString(),
+                        ProbationOfficerPhone = drJPO["phone"].ToString(),
+                        ProbationOfficerEmail = drJPO["email"].ToString(),
+                    };
+
+                    notification.StaffContact.Add(jpo);
+                }
+                //----------------------------------------------------------------------------
+
+                return notification;
+            }
+            else
+            {
+                return null;
+            }
+            //-----------------------------------------------------------------            
+        }
+
+        private void CallStoredProc(string strEventName, int iSIN, int iPK)
+        {
+            oCon = new OracleConnection();
+            oCmd = new OracleCommand();
+
+            string sUsername = string.Empty;
+            string sPassword = string.Empty;
+            string sDBname = string.Empty;
+
+            //go get the db credentials from the configuration file
+            ReadXmlConfig(ref sUsername, ref sPassword, ref sDBname);
+
+            oCon.ConnectionString = "user id=" + sUsername + ";data source=" + sDBname + ";password=" + sPassword;//don't forget to grant this user execute privs on the package!
+            eventLog.WriteEntry("NOTIFICATION_SERVICE procedure call - event name: " + strEventName + ", SIN = " + iSIN + ", PK = " + iPK);
+
+            try
+            {
+                oCmd.CommandText = "IJOS.PKG_FACS_API.NOTIFICATION_SERVICE";
+                oCmd.CommandType = CommandType.StoredProcedure;
+                oCmd.Connection = oCon;
+
+                oCmd.Parameters.Clear();
+                oCmd.Parameters.Add(new OracleParameter("v_event_name", OracleDbType.Varchar2)).Value = strEventName;
+                oCmd.Parameters.Add(new OracleParameter("v_sin", OracleDbType.Int32)).Value = iSIN;
+                oCmd.Parameters.Add(new OracleParameter("v_id", OracleDbType.Int32)).Value = iPK;
+                oCmd.Parameters.Add(new OracleParameter("cur_event_info", OracleDbType.RefCursor)).Direction = System.Data.ParameterDirection.Output;
+
+                OracleDataAdapter myAdapter = new OracleDataAdapter(oCmd);
+                ds = new DataSet("RemoteData");
+                ds.Tables.Add("UserData");
+
+                myAdapter.Fill(ds, "UserData");
+            }
+            catch (OracleException oException)
+            {
+                eventLog.WriteEntry("Error Calling IDHW Stored Procedure: " + oException.Message);
+            }
+        }
+
+        /// <summary>
+        /// Calls a procedure that notifies IJOS Support that there was a problem with the process
+        /// </summary>
+        /// <param name="strEventName">Will most likely be from the Client Match or Notification process</param>
+        /// <param name="iSIN">IJOS#</param>
+        /// <param name="iPK">Either the IDHW client ID or the PK from the staging/linkage table</param>
+        /// <param name="strErrorCode">Status Code returned from the API</param>
+        /// <param name="strMessage">Error Message details from the API</param>
+        private void CallErrorProc(string strEventName, int iSIN, int iPK, string strErrorCode, string strMessage)
+        {
+            oCon = new OracleConnection();
+            oCmd = new OracleCommand();
+
+            string sUsername = string.Empty;
+            string sPassword = string.Empty;
+            string sDBname = string.Empty;
+
+            //go get the db credentials from the configuration file
+            ReadXmlConfig(ref sUsername, ref sPassword, ref sDBname);
+
+            oCon.ConnectionString = "user id=" + sUsername + ";data source=" + sDBname + ";password=" + sPassword;//don't forget to grant this user execute privs on the package!
+
+            try
+            {
+                oCmd.CommandText = "IJOS.PKG_FACS_API.PROCESS_ERROR";
+                oCmd.CommandType = CommandType.StoredProcedure;
+                oCmd.Connection = oCon;
+
+                oCmd.Parameters.Clear();
+                oCmd.Parameters.Add(new OracleParameter("v_event_name", OracleDbType.Varchar2)).Value = strEventName;
+                oCmd.Parameters.Add(new OracleParameter("v_sin", OracleDbType.Int32)).Value = iSIN;
+                oCmd.Parameters.Add(new OracleParameter("v_id", OracleDbType.Int32)).Value = iPK;
+                oCmd.Parameters.Add(new OracleParameter("v_error_code", OracleDbType.Varchar2)).Value = strErrorCode;
+                oCmd.Parameters.Add(new OracleParameter("v_message", OracleDbType.Varchar2)).Value = strMessage;
+                oCmd.Parameters.Add(new OracleParameter("cur_info", OracleDbType.RefCursor)).Direction = System.Data.ParameterDirection.Output;
+
+                OracleDataAdapter myAdapter = new OracleDataAdapter(oCmd);
+                ds = new DataSet("RemoteData");
+                ds.Tables.Add("UserData");
+
+                myAdapter.Fill(ds, "UserData");
+            }
+            catch (OracleException oException)
+            {
+                eventLog.WriteEntry("Error Calling IDHW Stored Procedure: " + oException.Message);
+            }
+        }
+
+        //MUST HAVE THIS METHOD TO RUN THE SERVICE - IT DEPENDS ON THE .XML FILE TO LOCATE THE USERNAME AND PASSWORD TO CALL THE DB
+        private void ReadXmlConfig(ref String sUsername, ref String sPassword, ref String sDBname)
+        {
+            String sElement = string.Empty;
+            String sPath = System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().GetName().CodeBase).Replace(@"file:\", string.Empty);
+            XmlTextReader textReader = new XmlTextReader(sPath + @"\IDHWConfig.xml");
+
+            while (textReader.Read())
+            {
+                switch (textReader.NodeType)
+                {
+                    case XmlNodeType.Element:
+                        sElement = textReader.Name;
+                        break;
+                    case XmlNodeType.Text:
+                        switch (sElement)
+                        {
+                            case "Username":
+                                sUsername = textReader.Value;
+                                break;
+                            case "Password":
+                                sPassword = textReader.Value;
+                                break;
+                            case "DBname":
+                                sDBname = textReader.Value;
+                                break;
+                        }
+                        break;
+                }
+            }
+            textReader.Close();
+        }
+
+        private IRestResponse CallIDHWAPI(string URL, string JSONBody, Method method = Method.POST)
+        {
+            IRestResponse APIResponse = null;
+
+            //get the OAuth Token First
+            var resp = GetOAuthToken();
+
+            try
+            {
+                //If it gets the OAuth token (return status of OK) then continue to call the client API
+                if (resp.StatusCode == System.Net.HttpStatusCode.OK)
+                {
+                    Token tok = JsonConvert.DeserializeObject<Token>(resp.Content);
+
+                    //Call DHW API passing the retrieved OATH Token
+                    var restClient = new RestClient(URL);
+                    var restRequest = new RestRequest(method);
+                    restRequest.AddHeader("cache-control", "no-cache");
+                    //restRequest.AddHeader("content-type", "application/x-www-form-urlencoded");//this is used for the web application, not the service call
+                    restRequest.AddHeader("content-type", "application/json");
+                    restRequest.AddHeader("x-response_type", "200");
+                    restRequest.AddHeader("Authorization", string.Format("Bearer {0}", tok.AccessToken));
+
+                    if (string.IsNullOrWhiteSpace(JSONBody) == false)
+                        restRequest.AddJsonBody(JSONBody);
+
+                    APIResponse = restClient.Execute(restRequest);
+                }
+                else
+                {
+                    //Handle the response otherwise
+                    eventLog.WriteEntry("CallIDHWAPI method - resp.StatusCode = " + resp.StatusCode);
+                    APIResponse = resp;
+                }
+            }
+            catch (OracleException oException)
+            {
+                //add a write to the event log here...or send an email to IJOS Support
+                eventLog.WriteEntry("Error retrieving OAuth Token: " + oException.Message);
+            }
+
+            return APIResponse;
+        }
+
+        private IRestResponse GetOAuthToken()
+        {
+            //Get settings necessary to make call to get OATH Token
+            var clientID = ConfigurationManager.AppSettings.Get("ClientID");
+            var clientSecret = ConfigurationManager.AppSettings.Get("ClientSecret");
+            var clientScope = ConfigurationManager.AppSettings.Get("ClientScope");
+            string url = ConfigurationManager.AppSettings.Get("oAuthURL");
+            string param = String.Format("grant_type=client_credentials&client_id={0}&client_secret={1}&scope={2}"
+                                        , clientID, clientSecret, clientScope);
+
+            //Retrieve the OATH Token 
+            var client = new RestClient(url);
+            var request = new RestRequest(Method.POST);
+
+            try
+            {
+                request.AddHeader("cache-control", "no-cache");
+                request.AddHeader("content-type", "application/x-www-form-urlencoded");
+                request.AddParameter("application/x-www-form-urlencoded", param, ParameterType.RequestBody);
+
+                IRestResponse response = client.Execute(request);
+                return response;
+            }
+            catch (OracleException oException)
+            {
+                //add a write to the event log here...or send an email to IJOS Support
+                eventLog.WriteEntry("Error retrieving OAuth Token: " + oException.Message + "\nRequest = " + request);
+
+                return null;
+            }
+        }
+
+        protected override void OnStop()
+        {
+            // TODO: Add code here to perform any tear-down necessary to stop your service.
+            eventLog.WriteEntry("IDHWService Stopped");
+        }
+    }
+}

@@ -1,0 +1,159 @@
+﻿using IDHWDataSharing.Models;
+using IDHWDataSharing.Services;
+using Newtonsoft.Json;
+using RestSharp;
+using System;
+using System.Collections.Generic;
+using System.Configuration;
+using System.Net.Http;
+using System.Threading.Tasks;
+using System.Web.Mvc;
+using static IDHWDataSharing.Services.IDHWUtil;
+
+namespace IDHWDataSharing.Controllers
+{
+    [Authorize(Roles = @"idjc\IDHW_Data_Sharing")]
+    public class HomeController : AsyncController
+    {
+        public ActionResult Index(string txtID)
+        //public ActionResult Index(IDHWDataSharing.Models.IDHWMetadata mData)
+        {
+            IRestResponse response = null;
+            //IDHWMetadata test = null;
+            IDHWMetadata mData = null;
+            
+            if(txtID != null)
+            //if (mData.DJCClientId.ToString() != "0")
+            {
+                //**FIRST, check the facs_linkage table for a match!  If there's no match, don't go any further...**
+
+
+                //create the URL to pass to the API, using the ID the user enters
+                string clientURL = string.Format(ConfigurationManager.AppSettings.Get("dhwESPIURL")
+                                + "v1/clients/{0}/cw/metadata",
+                                //mData.DJCClientId);
+                                txtID);
+
+                //pass the URL to the IDHW API...
+                response = CallIDHWAPI(clientURL, "", Method.GET);
+
+                mData = JsonConvert.DeserializeObject<IDHWMetadata>(response.Content);
+
+                //test = JsonConvert.DeserializeObject<IDHWMetadata>(response.Content);
+                //test.DJCClientId = mData.DJCClientId;  
+
+                if (response.StatusCode.ToString() == "OK")
+                {
+                    //ModelState.AddModelError("Results", response.Content);//show the JSON code
+
+                    //add this match to the database, if it doesn't already exist
+                }
+                else if (response.StatusCode.ToString() == "444")
+                {
+                    ModelState.AddModelError("Results", "An unique FACS record for IJOS# " + txtID + " was not found.");
+                }
+                else
+                {
+                    ModelState.AddModelError("Results", "The following error occurred: Code: "+ response.StatusCode.ToString() + " - " + response.StatusDescription + ".\nPlease check back later or contact IJOS Support for further assistance (support@ijos.idaho.gov).");
+                }               
+            }
+
+            //return View(test);
+            return View(mData);
+        }
+
+        public ActionResult Search(int DJCClientId)
+        {
+            var mData = new IDHWMetadata();
+            IRestResponse response = null;
+
+            if (DJCClientId.ToString() != "0")
+            {
+                //create the URL to pass to the API, using the ID the user enters
+                string clientURL = string.Format(ConfigurationManager.AppSettings.Get("dhwESPIURL")
+                                + "v1/clients/{0}/cw/metadata",
+                                DJCClientId);
+
+                //pass the URL to the IDHW API...
+                response = CallIDHWAPI(clientURL, "", Method.GET);
+
+                //ModelState.AddModelError("Results", response.Content);//this works - Now format it better
+                ModelState.AddModelError("Results", JsonConvert.DeserializeObject(response.Content).ToString());
+            }
+            
+            //return Json(response.Content);
+            return View(mData);
+        }
+
+        public ActionResult About()
+        {
+            ViewBag.Message = "Your application description page.";
+
+            return View();
+        }
+
+        public ActionResult Contact()
+        {
+            ViewBag.Message = "Your contact page.";
+
+            return View();
+        }
+
+        private IRestResponse GetOAuthToken()
+        {
+            //Get settings necessary to make call to get OATH Token
+            var clientID = ConfigurationManager.AppSettings.Get("ClientID");
+            var clientSecret = ConfigurationManager.AppSettings.Get("ClientSecret");
+            var clientScope = ConfigurationManager.AppSettings.Get("ClientScope");
+            string url = ConfigurationManager.AppSettings.Get("oAuthURL");
+            string param = String.Format("grant_type=client_credentials&client_id={0}&client_secret={1}&scope={2}"
+                                        , clientID, clientSecret, clientScope);
+
+            //Retrieve the OATH Token 
+            var client = new RestClient(url);
+            var request = new RestRequest(Method.POST);
+            request.AddHeader("cache-control", "no-cache");
+            request.AddHeader("content-type", "application/x-www-form-urlencoded");
+            request.AddParameter("application/x-www-form-urlencoded", param, ParameterType.RequestBody);
+            IRestResponse response = client.Execute(request);
+
+            return response;
+        }
+
+        public IRestResponse CallIDHWAPI(string URL, string JSONBody, RestSharp.Method method = RestSharp.Method.GET)
+        {
+            IRestResponse APIResponse = null;
+
+            //get the OAuth Token First
+            var resp = GetOAuthToken();
+
+            //If it gets the OAuth token (return status of OK) then continue to call the client API
+            if (resp.StatusCode == System.Net.HttpStatusCode.OK)
+            {
+                Token tok = JsonConvert.DeserializeObject<Token>(resp.Content);
+                //var clientURL = ConfigurationManager.AppSettings.Get("dhwESPIURL") + "v1/clients";
+
+
+                //Call DHW API passing the retrieved OATH Token
+                var restClient = new RestClient(URL);
+                var restRequest = new RestRequest(method);
+                //restRequest.AddHeader("cache-control", "no-cache");
+                //restRequest.AddHeader("content-type", "application/x-www-form-urlencoded");
+                //restRequest.AddHeader("x-response_type", "200");
+                restRequest.AddHeader("Authorization", string.Format("Bearer {0}", tok.AccessToken));
+
+                if (string.IsNullOrWhiteSpace(JSONBody) == false)
+                    restRequest.AddJsonBody(JSONBody);
+
+                APIResponse = restClient.Execute(restRequest);
+            }
+            else
+            {
+                //Handle the response otherwise
+                APIResponse = resp;
+            }
+
+            return APIResponse;
+        }
+    }
+}
